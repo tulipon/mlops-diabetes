@@ -54,7 +54,8 @@ pro-fin/
 │       ├── train.py         # CV, candidatos y tracking MLflow
 │       └── registry.py      # Registro, quality gate y alias champion
 ├── notebooks/
-│   └── Proyecto_MLOps.ipynb # Fase exploratoria y mapeo al repositorio
+│   ├── Proyecto_MLOps.ipynb # Fase exploratoria y mapeo al repositorio
+│   └── Colab.ipynb          # Ejecución end-to-end en Google Colab
 ├── tests/
 │   ├── test_data.py
 │   ├── test_features.py
@@ -111,6 +112,20 @@ source .venv/bin/activate
 
 Versiones principales fijadas en `requirements.txt`: MLflow 3.17.2,
 scikit-learn 1.9.1, FastAPI 0.162.0, pandas 3.1.0 y NumPy 2.5.4.
+
+### Google Colab
+
+[![Abrir en Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/tulipon/mlops-diabetes/blob/main/notebooks/Colab.ipynb)
+
+Para ejecutar el proyecto sin Docker, abre `notebooks/Colab.ipynb` y ejecuta
+las celdas en orden. El notebook clona el repositorio, instala `uv`, lanza los
+tests y el pipeline, arranca la API en segundo plano y la publica con
+`google.colab.output.serve_kernel_port_as_iframe`. Incluye celdas opcionales
+para la interfaz de MLflow y para guardar `mlflow.db`, `mlruns/` y `reports/`
+en Google Drive.
+
+Colab no ofrece un daemon de Docker fiable y su almacenamiento es efímero: sin
+montar Drive, el estado se pierde al desconectar el runtime.
 
 ---
 
@@ -661,6 +676,9 @@ La conclusión se corrigió para reflejar que GradientBoosting y LinearRegressio
 estaban prácticamente empatados en el test del notebook, y que la mejora de las
 features engineered debía validarse con CV antes de promoverla. En el pipeline
 final, la validación cruzada seleccionó LinearRegression con features raw.
+
+Para ejecutar el flujo completo en Colab (tests, pipeline, API y MLflow), usa
+`notebooks/Colab.ipynb`; no requiere Docker.
 
 ---
 
