@@ -1,0 +1,89 @@
+name: MLOps CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mlops-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pipeline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      MLFLOW_TRACKING_URI: sqlite:///${{ github.workspace }}/mlflow.db
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Run tests
+        run: pytest -q
+
+      - name: Run MLOps pipeline
+        run: python -m mlops.pipeline
+
+      - name: API smoke tests
+        run: |
+          set -euo pipefail
+          python -m uvicorn api.main:app --host 127.0.0.1 --port 8000 > uvicorn.log 2>&1 &
+          echo $! > uvicorn.pid
+
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8000/health 2>/dev/null; then
+              break
+            fi
+            sleep 1
+          done
+
+          echo "--- /model-info"
+          curl -fsS http://127.0.0.1:8000/model-info
+
+          echo "--- /predict"
+          curl -fsS -X POST http://127.0.0.1:8000/predict \
+            -H "Content-Type: application/json" \
+            -d '{"age":0.038076,"sex":0.050680,"bmi":0.061696,"bp":0.021872,"s1":-0.044223,"s2":-0.034821,"s3":-0.043401,"s4":-0.002592,"s5":0.019907,"s6":-0.017646}'
+
+          echo "--- invalid input must return 422"
+          INVALID_STATUS=$(curl -sS -o /tmp/invalid.json -w "%{http_code}" \
+            -X POST http://127.0.0.1:8000/predict \
+            -H "Content-Type: application/json" \
+            -d '{"age":0.038076}')
+          cat /tmp/invalid.json
+          test "$INVALID_STATUS" = "422"
+
+          kill "$(cat uvicorn.pid)" 2>/dev/null || true
+
+      - name: Upload MLflow and reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mlops-artifacts
+          if-no-files-found: warn
+          path: |
+            mlflow.db
+            mlruns/
+            reports/
+            data/processed/
+            uvicorn.log

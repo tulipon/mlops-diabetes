@@ -1,0 +1,28 @@
+# Entorno y cachés
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+
+# MLflow: estado local generado por el pipeline
+mlruns/
+mlflow.db
+mlflow.db-shm
+mlflow.db-wal
+
+# Artefactos generados
+data/processed/*
+!data/processed/.gitkeep
+reports/*
+!reports/.gitkeep
+uvicorn.log
+*.pid
+
+# Configuración local
+.env
+.env.*
+!.env.example
+.DS_Store
