@@ -87,3 +87,83 @@ jobs:
             reports/
             data/processed/
             uvicorn.log
+
+  docker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: pipeline
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build and start stack
+        run: docker compose up -d --build
+
+      - name: Wait for API and champion
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 120); do
+            if curl -fsS http://127.0.0.1:8000/model-info > /tmp/model-info.json 2>/dev/null; then
+              cat /tmp/model-info.json
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "La API no cargó el champion a tiempo"
+          docker compose ps
+          docker compose logs
+          exit 1
+
+      - name: Docker smoke tests
+        run: |
+          set -euo pipefail
+          echo "--- /health"
+          curl -fsS http://127.0.0.1:8000/health
+          echo
+
+          echo "--- /model-info"
+          curl -fsS http://127.0.0.1:8000/model-info
+          echo
+
+          echo "--- /predict"
+          curl -fsS -X POST http://127.0.0.1:8000/predict \
+            -H "Content-Type: application/json" \
+            -d '{"age":0.038076,"sex":0.050680,"bmi":0.061696,"bp":0.021872,"s1":-0.044223,"s2":-0.034821,"s3":-0.043401,"s4":-0.002592,"s5":0.019907,"s6":-0.017646}'
+          echo
+
+          echo "--- invalid input must return 422"
+          INVALID_STATUS=$(curl -sS -o /tmp/invalid.json -w "%{http_code}" \
+            -X POST http://127.0.0.1:8000/predict \
+            -H "Content-Type: application/json" \
+            -d '{"age":0.038076}')
+          cat /tmp/invalid.json
+          test "$INVALID_STATUS" = "422"
+
+      - name: Restart API and verify champion persistence
+        run: |
+          set -euo pipefail
+          VERSION_BEFORE=$(curl -fsS http://127.0.0.1:8000/model-info | \
+            python -c "import json,sys; print(json.load(sys.stdin)['model_version'])")
+          docker compose restart api
+
+          for i in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:8000/model-info > /tmp/model-info-after.json 2>/dev/null; then
+              break
+            fi
+            sleep 2
+          done
+
+          VERSION_AFTER=$(python -c "import json; print(json.load(open('/tmp/model-info-after.json'))['model_version'])")
+          echo "Antes: v$VERSION_BEFORE | Después: v$VERSION_AFTER"
+          test "$VERSION_BEFORE" = "$VERSION_AFTER"
+
+      - name: Show logs on failure
+        if: failure()
+        run: |
+          docker compose ps
+          docker compose logs
+
+      - name: Teardown
+        if: always()
+        run: docker compose down -v

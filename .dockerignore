@@ -1,0 +1,35 @@
+# Control de versiones y metadatos
+.git/
+.github/
+.gitignore
+README.md
+Proyecto_MLOps.txt
+
+# Entorno local y cachés
+.venv/
+**/__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+
+# Estado local de MLflow y artefactos generados
+mlruns/
+mlflow.db
+mlflow.db-shm
+mlflow.db-wal
+data/
+reports/
+*.log
+*.pid
+
+# Contenido que no forma parte de la imagen de runtime
+notebooks/
+tests/
+requirements-dev.txt
+pytest.ini
+
+# Configuración local
+.env
+.env.*

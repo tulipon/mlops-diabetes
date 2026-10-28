@@ -8,8 +8,8 @@ separadas de datos, entrenamiento, registro de modelos, serving y CI/CD.
 El objetivo no es construir una plataforma de producción completa, sino
 demostrar de forma práctica los conceptos clave de MLOps: extracción,
 validación y limpieza de datos, tracking de experimentos, Model Registry,
-selección de un modelo champion, API de inferencia, manejo de errores y
-automatización con GitHub Actions.
+selección de un modelo champion, API de inferencia, manejo de errores,
+despliegue con Docker Compose y automatización con GitHub Actions.
 
 ---
 
@@ -65,6 +65,9 @@ pro-fin/
 │   └── processed/           # CSV limpio (generado)
 ├── reports/                 # Informes JSON generados
 ├── .github/workflows/ci.yml
+├── Dockerfile
+├── docker-compose.yml
+├── .dockerignore
 ├── requirements.txt
 ├── requirements-dev.txt
 ├── Makefile
@@ -72,7 +75,9 @@ pro-fin/
 └── README.md
 ```
 
-No se incluye Docker: queda fuera del alcance acordado para esta entrega.
+El flujo nativo con `uv` es la vía principal de desarrollo. Docker se incluye
+como capa de despliegue opcional (sección 7) y no es necesario para ejecutar
+`make setup`, `make pipeline` ni `make api`.
 
 ---
 
@@ -83,6 +88,8 @@ Requisitos:
 - Python 3.13.
 - [`uv`](https://docs.astral.sh/uv/) para crear el entorno.
 - Git, opcional para clonar/publicar el repositorio.
+- Docker y Docker Compose, opcionales para la capa de despliegue de la
+  sección 7.
 
 ```bash
 # Crear el entorno con Python 3.13 e instalar dependencias
@@ -370,7 +377,180 @@ Así se evita el skew entre entrenamiento y serving.
 
 ---
 
-## 7. Manejo de errores
+## 7. Despliegue con Docker
+
+Docker es una **capa de despliegue opcional**. El flujo nativo con `uv`
+(`make setup`, `make pipeline`, `make api`) sigue siendo la vía principal para
+desarrollo y no requiere Docker. La capa Docker empaqueta el mismo código y
+reproduce el ciclo completo: entrenar, registrar y servir.
+
+### Arquitectura
+
+```text
+localhost:8000                              localhost:5000
+      │                                           │
+┌─────▼──────┐        models:/...@champion   ┌───▼────────┐
+│    api     │ ─────────────────────────────▶│   mlflow   │
+│  FastAPI   │                               │  tracking  │
+└─────▲──────┘                               │  registry  │
+      │                                      └───┬────┬───┘
+      │                                          │    │
+┌─────┴────────────┐                    mlflow-data  mlflow-artifacts
+│ pipeline         │                         (volúmenes)
+│ one-shot         │
+│ extract→train→reg│
+└──────────────────┘
+        │
+  pipeline-data / pipeline-reports
+```
+
+| Servicio | Tipo | Puerto | Función |
+|---|---|---:|---|
+| `mlflow` | largo | 5000 | Tracking, Model Registry y proxy de artefactos |
+| `pipeline` | one-shot | — | Extrae, valida, limpia, entrena y registra |
+| `api` | largo | 8000 | Sirve el champion con FastAPI |
+
+Volúmenes con nombre:
+
+- `mlflow-data`: base SQLite de MLflow.
+- `mlflow-artifacts`: artefactos de runs y modelos.
+- `pipeline-data`: CSV crudo y limpio.
+- `pipeline-reports`: informes JSON del pipeline.
+
+El estado sobrevive a reinicios y a `docker compose down`. Solo se elimina con
+`make docker-reset` (`docker compose down -v`).
+
+### Requisitos
+
+- Docker Engine 24 o superior y Docker Compose v2.
+- El usuario debe pertenecer al grupo `docker`, o ejecutar los comandos con
+  `sudo`.
+- Puertos 5000 y 8000 libres.
+
+Comprueba la instalación:
+
+```bash
+docker info
+docker compose version
+```
+
+Si acabas de añadir tu usuario al grupo `docker`, cierra la sesión y vuelve a
+entrar para que el cambio surta efecto. Mientras tanto, `docker` puede seguir
+pidiendo permisos aunque el daemon esté activo.
+
+### Construcción y arranque
+
+```bash
+make docker-up
+```
+
+Equivale a:
+
+```bash
+docker compose up -d --build
+```
+
+Orden de arranque:
+
+1. `mlflow` arranca y espera a que su healthcheck responda.
+2. `pipeline` ejecuta `python -m mlops.pipeline` contra `http://mlflow:5000`.
+3. `api` arranca cuando el pipeline termina correctamente y carga
+   `models:/diabetes-progression-model@champion`.
+
+La primera construcción tarda varios minutos porque instala MLflow,
+scikit-learn, pandas y el resto de dependencias. Las siguientes reutilizan la
+caché de Docker.
+
+Consulta el estado:
+
+```bash
+make docker-ps
+```
+
+### URLs y verificación
+
+- API: <http://localhost:8000>
+- Swagger: <http://localhost:8000/docs>
+- MLflow: <http://localhost:5000>
+
+```bash
+curl http://localhost:8000/health
+curl http://localhost:8000/model-info
+curl -X POST http://localhost:8000/predict \
+  -H "Content-Type: application/json" \
+  -d '{
+    "age": 0.038076,
+    "sex": 0.050680,
+    "bmi": 0.061696,
+    "bp": 0.021872,
+    "s1": -0.044223,
+    "s2": -0.034821,
+    "s3": -0.043401,
+    "s4": -0.002592,
+    "s5": 0.019907,
+    "s6": -0.017646
+  }'
+```
+
+La respuesta de `/model-info` debe incluir `champion_alias: "champion"` y una
+versión concreta. La predicción de referencia es `210.74098559942396`.
+
+El healthcheck del contenedor `api` consulta `/model-info`, no solo `/health`.
+Así, un contenedor que arranca sin champion se marca como `unhealthy` y el
+despliegue no se considera correcto. Si el quality gate no promociona ningún
+modelo, la API arranca igualmente en modo degradado y responde `503`; el
+contenedor queda `unhealthy` de forma intencionada.
+
+### Reentrenar dentro de Docker
+
+```bash
+make docker-pipeline
+```
+
+Registra una nueva versión en MLflow. El quality gate decide si reemplaza el
+alias `champion`; si no mejora el RMSE del champion vigente, se conserva el
+anterior y la API sigue sirviendo el modelo existente.
+
+### Logs, parada y limpieza
+
+```bash
+make docker-logs    # logs de api y mlflow
+make docker-down    # para y elimina contenedores; conserva volúmenes
+make docker-reset   # para y elimina también los volúmenes
+```
+
+Para recuperar los informes generados por el pipeline:
+
+```bash
+docker compose cp pipeline:/app/reports/pipeline_report.json reports/
+docker compose cp pipeline:/app/reports/validation_report_clean.json reports/
+```
+
+El comando funciona mientras el contenedor `pipeline` siga existiendo, por
+ejemplo después de `make docker-up`. Si se ejecutó con `make docker-pipeline`
+(`run --rm`), el contenedor se elimina al terminar; en ese caso los informes
+quedan en el volumen `pipeline-reports`.
+
+### Limitaciones de la capa Docker
+
+- **SQLite y un solo worker:** MLflow se ejecuta con `--workers 1` porque
+  SQLite no soporta bien escrituras concurrentes. Es adecuado para local y
+  demostración, no para un equipo grande.
+- **Sin autenticación:** MLflow y la API quedan expuestos sin credenciales. No
+  publiques estos puertos en Internet sin un reverse proxy con TLS y
+  autenticación.
+- **Artefactos locales:** el proxy de MLflow sirve los artefactos desde un
+  volumen local. En producción se usaría almacenamiento de objetos (S3, GCS,
+  Azure Blob) y PostgreSQL.
+- **Un solo host:** Compose no proporciona alta disponibilidad ni escalado
+  horizontal real.
+- **Imagen grande:** MLflow y scikit-learn ocupan bastante; la imagen final
+  ronda 1–1,5 GB. La etapa multi-stage evita incluir herramientas de build,
+  pero no reduce las dependencias de runtime.
+
+---
+
+## 8. Manejo de errores
 
 | Caso | Código | Comportamiento |
 |---|---:|---|
@@ -394,7 +574,7 @@ curl -i -X POST http://127.0.0.1:8000/predict \
 
 ---
 
-## 8. Tests
+## 9. Tests
 
 ```bash
 make test
@@ -420,10 +600,12 @@ Estado esperado: **33 tests passed**.
 
 ---
 
-## 9. CI/CD con GitHub Actions
+## 10. CI/CD con GitHub Actions
 
 El workflow `.github/workflows/ci.yml` se ejecuta en cada push o pull request a
-`main`/`master` y realiza:
+`main`/`master` y contiene dos jobs.
+
+### Job `pipeline` (flujo nativo)
 
 1. Checkout y configuración de Python 3.13 con caché de pip.
 2. Instalación de `requirements.txt` y `requirements-dev.txt`.
@@ -437,11 +619,24 @@ El workflow `.github/workflows/ci.yml` se ejecuta en cada push o pull request a
 6. Subida de artefactos: `mlflow.db`, `mlruns/`, `reports/`, datos procesados y
    logs de uvicorn.
 
+### Job `docker` (capa de despliegue)
+
+Se ejecuta después del job nativo y valida la imagen y Compose de principio a
+fin:
+
+1. `docker compose up -d --build`.
+2. Espera a que la API cargue el champion en `/model-info`.
+3. Smoke tests: `/health`, `/model-info`, `/predict` y `422`.
+4. Reinicia el contenedor `api` y comprueba que se sirve la misma versión del
+   champion, verificando la persistencia en los volúmenes.
+5. Si algo falla, publica `docker compose ps` y los logs.
+6. Siempre ejecuta `docker compose down -v` para limpiar el runner.
+
 El registry de CI es efímero: cada job parte de un runner limpio y reconstruye
 el modelo y el alias `champion`. Es suficiente para demostrar la automatización.
 Para persistencia entre ejecuciones habría que usar un tracking server remoto
-(por ejemplo, un servidor MLflow con base de datos y almacenamiento de
-artefactos compartidos), que queda fuera del alcance de esta entrega.
+(por ejemplo, un servidor MLflow con PostgreSQL y almacenamiento de objetos),
+que queda fuera del alcance de esta entrega.
 
 Si el quality gate no se cumple, el pipeline no asigna champion y el smoke test
 de `/model-info`/`/predict` fallará; esto es intencionado: el CI actúa como
@@ -449,7 +644,7 @@ bloqueo de promoción.
 
 ---
 
-## 10. Notebook exploratorio
+## 11. Notebook exploratorio
 
 El notebook se conserva en
 `notebooks/Proyecto_MLOps.ipynb` como evidencia de la fase de ciencia de datos.
@@ -469,7 +664,7 @@ final, la validación cruzada seleccionó LinearRegression con features raw.
 
 ---
 
-## 11. Reproducibilidad
+## 12. Reproducibilidad
 
 - Semilla fija `42` para split, KFold y modelos.
 - Versiones principales fijadas en `requirements.txt`.
@@ -486,11 +681,13 @@ no el CSV crudo. La siguiente ejecución reconstruye todo.
 
 ---
 
-## 12. Limitaciones y siguientes pasos
+## 13. Limitaciones y siguientes pasos
 
-- **Sin Docker:** se dejó fuera por alcance; el serving se ejecuta en local.
-- **Registry local:** SQLite y artefactos en disco; no hay alta disponibilidad
-  ni autenticación.
+- **Despliegue local:** tanto el flujo nativo como Compose están pensados para
+  un solo host; no hay alta disponibilidad ni escalado horizontal.
+- **Registry local/SQLite:** MLflow usa SQLite y artefactos en un volumen; no
+  hay autenticación ni escrituras concurrentes. Es una capa de demostración,
+  no una plataforma de producción.
 - **Dataset pequeño:** 442 filas; las métricas tienen variabilidad y el umbral
   estricto puede fallar con otra partición.
 - **Features estandarizadas:** la API espera valores tal como los devuelve
@@ -499,13 +696,13 @@ no el CSV crudo. La siguiente ejecución reconstruye todo.
 - **Sin explicabilidad** (SHAP, importancia de variables) más allá de las
   métricas.
 
-Posibles extensiones: tracking server remoto, Docker, autenticación de la API,
-monitorización de drift, tests de contrato más estrictos y un pipeline de
-reentrenamiento programado.
+Posibles extensiones: MLflow con PostgreSQL y almacenamiento de objetos,
+autenticación de la API, monitorización de drift, tests de contrato más
+estrictos y un pipeline de reentrenamiento programado.
 
 ---
 
-## 13. Solución de problemas
+## 14. Solución de problemas
 
 **`models:/...@champion` no existe o `/model-info` devuelve 503**
 
@@ -544,4 +741,47 @@ source .venv/bin/activate
 ```bash
 make clean
 make pipeline
+```
+
+**Docker: `permission denied` al conectar con `/var/run/docker.sock`**
+
+El daemon debe estar activo y tu usuario debe pertenecer al grupo `docker`:
+
+```bash
+sudo systemctl start docker
+sudo usermod -aG docker "$USER"
+# Cierra la sesión y vuelve a entrar
+docker info
+```
+
+**Docker: el contenedor `api` está `unhealthy`**
+
+Consulta los logs y el estado del pipeline:
+
+```bash
+make docker-ps
+docker compose logs api pipeline mlflow
+```
+
+Si `/model-info` devuelve `503`, el pipeline terminó pero el quality gate no
+promocionó ningún modelo. Revisa `reports/pipeline_report.json` dentro del
+volumen o los logs de `pipeline`.
+
+**Docker: puerto 5000 u 8000 ocupado**
+
+Para el servicio local que esté usando el puerto (`make api` o
+`make mlflow-server`) o cambia la publicación de puertos en
+`docker-compose.yml`:
+
+```yaml
+ports:
+  - "8001:8000"   # API en localhost:8001
+  - "5001:5000"   # MLflow en localhost:5001
+```
+
+**Docker: quiero borrar también el estado de MLflow**
+
+```bash
+make docker-reset   # docker compose down -v
+make docker-up
 ```
